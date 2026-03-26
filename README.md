@@ -1,4 +1,4 @@
-# FoodBridge SG — Supermarket Surplus Forecasting & Beneficiary Matching
+# Supermarket Surplus Forecasting & Beneficiary Matching
 
 A data pipeline that tackles food wastage by predicting daily perishable surplus at supermarket level and matching NPO beneficiaries with the closest high-surplus stores for donation pickup.
 
