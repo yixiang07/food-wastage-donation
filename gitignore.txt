@@ -1,0 +1,23 @@
+# Data files
+*.csv
+
+# Outputs
+*.png
+*.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
