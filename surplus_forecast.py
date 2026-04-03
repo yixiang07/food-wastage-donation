@@ -1,22 +1,27 @@
 """
 Donor Surplus Forecast
 ======================
-Predicts daily perishable food surplus per supermarket using a
-Random Forest model trained on historical sales data.
+Predicts daily perishable food surplus per supermarket using a two-stage model:
+  Stage A — Random Forest Classifier  (will waste occur? 0/1)
+  Stage B — XGBoost Regressor         (how much waste, for rows predicted as 1)
+
+Training on non-zero rows in log-space then back-transforming via expm1 reduces
+the bias from the ~45 % of zero-waste rows that would otherwise pull a single
+regressor toward under-prediction.
 
 Pipeline:
     1. Load raw CSVs (sales, items, stores, transactions, oil, holidays)
     2. Filter to perishable items only
     3. Engineer target variable (7-day rolling avg − actual sales)
-    4. Add temporal, macro, and store-level features
-    5. Train Random Forest with 80/20 split
+    4. Add temporal, macro, store-level, and lag/volatility features
+    5. Train RF classifier + XGBoost regressor with 80/20 split
     6. Generate per-store surplus forecast for the most recent date
     7. Save donor_surplus_forecast.csv + visualisations
 
 Outputs:
     donor_surplus_forecast.csv   — per-store predicted surplus with urgency labels
     eda_charts.png               — 4-panel EDA visualisation
-    feature_importance.png       — ranked feature importance
+    feature_importance.png       — ranked XGBoost feature importance
     donor_dashboard.png          — donor-facing forecast dashboard
 
 Usage:
@@ -28,10 +33,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.patches import Patch
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score,
+    accuracy_score, f1_score, recall_score,
+)
 from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBRegressor
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -126,6 +135,19 @@ df["city_encoded"] = le.fit_transform(df["city"].astype(str))
 df["type_encoded"] = le.fit_transform(df["type"].astype(str))
 df["onpromotion"] = df["onpromotion"].fillna(0).astype(int)
 
+# Lag & rolling features — item-specific recent history
+df["waste_lag_1"] = df.groupby(["store_nbr", "item_nbr"])["estimated_waste"].shift(1)
+df["waste_lag_7"] = df.groupby(["store_nbr", "item_nbr"])["estimated_waste"].shift(7)
+df["sales_lag_1"] = df.groupby(["store_nbr", "item_nbr"])["unit_sales"].shift(1)
+df["avg_sales_14d"] = df.groupby(["store_nbr", "item_nbr"])["unit_sales"].transform(
+    lambda x: x.shift(1).rolling(14, min_periods=1).mean()
+)
+df["sales_volatility"] = df.groupby(["store_nbr", "item_nbr"])["unit_sales"].transform(
+    lambda x: x.shift(1).rolling(7, min_periods=1).std()
+)
+for col in ["waste_lag_1", "waste_lag_7", "sales_lag_1", "avg_sales_14d", "sales_volatility"]:
+    df[col] = df[col].fillna(0)
+
 print(f"  Final shape: {df.shape}")
 
 
@@ -167,8 +189,8 @@ plt.close()
 print("  Saved: eda_charts.png")
 
 
-# ── 6. Train model ───────────────────────────────────────────
-print("\n[6/10] Training Random Forest model...")
+# ── 6. Train two-stage model ─────────────────────────────────
+print("\n[6/10] Training two-stage model (RF classifier + XGBoost regressor)...")
 
 FEATURES = [
     "day_of_week", "month", "day_of_month", "is_weekend",
@@ -176,34 +198,91 @@ FEATURES = [
     "onpromotion", "dcoilwtico", "transactions",
     "type_encoded", "cluster", "city_encoded",
     "family_encoded", "avg_sales_7d",
+    # Lag / rolling features — item-specific recent history
+    "waste_lag_1", "waste_lag_7", "sales_lag_1",
+    "avg_sales_14d", "sales_volatility",
 ]
 
 X = df[FEATURES]
 y = df["estimated_waste"]
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
-model.fit(X_train, y_train)
+# Stage A — RF classifier: will waste occur?
+y_train_class = (y_train > 0).astype(int)
+y_test_class = (y_test > 0).astype(int)
 
-y_pred = model.predict(X_test)
-mae = mean_absolute_error(y_test, y_pred)
+classifier = RandomForestClassifier(
+    n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
+)
+classifier.fit(X_train, y_train_class)
+
+y_pred_class = classifier.predict(X_test)
+print(f"  [Stage A] Accuracy: {accuracy_score(y_test_class, y_pred_class):.3f}  "
+      f"Recall: {recall_score(y_test_class, y_pred_class):.3f}  "
+      f"F1: {f1_score(y_test_class, y_pred_class):.3f}")
+
+# Stage B — XGBoost regressor: how much waste? (trained on non-zero rows, log-space)
+df_nonzero = df[df["estimated_waste"] > 0].copy()
+X_nz = df_nonzero[FEATURES]
+y_nz_log = np.log1p(df_nonzero["estimated_waste"])
+
+X_train_nz, X_test_nz, y_train_nz_log, y_test_nz_log = train_test_split(
+    X_nz, y_nz_log, test_size=0.2, random_state=42
+)
+
+regressor = XGBRegressor(
+    n_estimators=300,
+    max_depth=8,
+    learning_rate=0.1,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
+    random_state=42,
+    n_jobs=-1,
+    verbosity=0,
+)
+regressor.fit(X_train_nz, y_train_nz_log)
+
+y_pred_nz = np.expm1(regressor.predict(X_test_nz)).clip(min=0)
+y_test_nz = np.expm1(y_test_nz_log)
+print(f"  [Stage B] MAE: {mean_absolute_error(y_test_nz, y_pred_nz):.2f} units  "
+      f"R²: {r2_score(y_test_nz, y_pred_nz):.3f}")
+
+# Combined two-stage prediction function
+def two_stage_predict(X_input):
+    """
+    1. Classifier gates whether waste occurs.
+    2. XGBoost predicts quantity (log-space → expm1) for rows where waste is expected.
+    """
+    X_df = X_input if isinstance(X_input, pd.DataFrame) else pd.DataFrame(X_input, columns=FEATURES)
+    X_df = X_df[FEATURES]
+    preds = np.zeros(len(X_df))
+    will_waste = classifier.predict(X_df) == 1
+    if will_waste.sum() > 0:
+        preds[will_waste] = np.expm1(regressor.predict(X_df[will_waste])).clip(min=0)
+    return preds
+
+# Evaluate combined model
+y_pred = two_stage_predict(X_test)
+mae  = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+r2   = r2_score(y_test, y_pred)
 
-print(f"  MAE:  {mae:.2f} units")
-print(f"  RMSE: {rmse:.2f} units")
+print(f"  [Combined] MAE: {mae:.2f} units  RMSE: {rmse:.2f} units  R²: {r2:.3f}")
 
 
-# ── 7. Feature importance ────────────────────────────────────
-print("\n[7/10] Analysing feature importance...")
+# ── 7. Feature importance (XGBoost) ──────────────────────────
+print("\n[7/10] Analysing XGBoost feature importance...")
 
 importance_df = pd.DataFrame(
-    {"feature": FEATURES, "importance": model.feature_importances_}
+    {"feature": FEATURES, "importance": regressor.feature_importances_}
 ).sort_values("importance", ascending=False)
 
 plt.figure(figsize=(10, 6))
 plt.barh(importance_df["feature"], importance_df["importance"], color="steelblue")
 plt.xlabel("Importance Score")
-plt.title("Feature Importance — What Drives Food Wastage?")
+plt.title("XGBoost Feature Importance — What Drives Food Wastage?")
 plt.gca().invert_yaxis()
 plt.tight_layout()
 plt.savefig("feature_importance.png", dpi=150, bbox_inches="tight")
@@ -224,7 +303,7 @@ if len(today_df) == 0:
     recent = df[df["date"] >= latest_date - pd.Timedelta(days=7)]
     today_df = recent.groupby(["store_nbr", "family"]).last().reset_index()
 
-today_df["predicted_waste"] = model.predict(today_df[FEATURES])
+today_df["predicted_waste"] = two_stage_predict(today_df[FEATURES])
 today_df["predicted_waste"] = today_df["predicted_waste"].clip(lower=0).round(1)
 
 donor_view = (
