@@ -2,7 +2,7 @@
 
 A data pipeline that tackles food wastage by predicting daily perishable surplus at supermarket level and matching NPO beneficiaries with the closest high-surplus stores for donation pickup.
 
-Built for the IS215 Digital Business module at SMU.
+Built for the IS215 Digital Business – Technologies and Transformation module at SMU.
 
 ## Problem
 
@@ -12,7 +12,7 @@ Supermarkets routinely over-order perishable goods (produce, bread, dairy, deli)
 
 FoodBridge SG closes this gap with two pipelines:
 
-1. **Donor Surplus Forecast** — a Random Forest model trained on historical sales data predicts tomorrow's surplus per store, so managers can adjust orders or schedule pickups proactively.
+1. **Donor Surplus Forecast** — a two-stage model (Random Forest Classifier + XGBoost Regressor) trained on historical sales data predicts tomorrow's surplus per store, so managers can adjust orders or schedule pickups proactively.
 2. **Beneficiary Matching Engine** — an AI scoring system recommends the best stores for each NPO to collect from, weighted by surplus volume, distance, collection history, and food category preferences.
 
 ## Pipeline Overview
@@ -22,7 +22,8 @@ FoodBridge SG closes this gap with two pipelines:
 │               Donor Pipeline (analytics)            │
 │                                                     │
 │  Raw Sales → Perishable Filter → Wastage Proxy      │
-│  → Feature Engineering → Random Forest → Forecast   │
+│  → Feature Engineering → RF Classifier (Stage A)   │
+│  → XGBoost Regressor log-space (Stage B)            │
 │  → donor_surplus_forecast.csv                       │
 └─────────────────────────────────────────────────────┘
                         │
@@ -32,16 +33,15 @@ FoodBridge SG closes this gap with two pipelines:
 │                                                     │
 │  Actual Surplus → Store Geolocation → Haversine     │
 │  → Match Scoring (surplus × distance × history)     │
-│  → dashboard_payload.json                           │
+│  → dashboard_payload.json + 5 component JSON files  │
 └─────────────────────────────────────────────────────┘
 ```
 
 ## Repository Structure
 
 ```
-├── notebooks/
-│   ├── analytics.ipynb          # Donor surplus forecast (interactive, with EDA charts)
-│   └── dashboard.ipynb          # Beneficiary matching engine (interactive)
+├── analytics2.ipynb             # Donor surplus forecast (interactive, with EDA charts)
+├── dashboard2.ipynb             # Beneficiary matching engine (interactive)
 ├── surplus_forecast.py          # Standalone donor forecast script
 ├── beneficiary_dashboard.py     # Standalone beneficiary matching script
 ├── requirements.txt
@@ -59,8 +59,19 @@ estimated_waste = 7-day shifted rolling avg sales − actual sales today
 
 The shift prevents data leakage (today's sales are excluded from "today's expected sales"), and the result is clipped to zero since negative waste has no physical meaning.
 
+### Two-Stage Forecast Model
+
+The donor forecast uses a two-stage approach to handle the ~45% of zero-waste rows that would otherwise pull a single regressor toward under-prediction:
+
+| Stage | Model | Task |
+|---|---|---|
+| A | Random Forest Classifier | Binary gate — will waste occur? (0/1) |
+| B | XGBoost Regressor | Quantity estimate — how much? (trained on non-zero rows in log-space, back-transformed via `expm1`) |
+
+Only rows predicted as wasteful by Stage A are passed to Stage B.
+
 ### Feature Engineering
-The model uses 14 features across six signal categories:
+The model uses 19 features across seven signal categories:
 
 | Category | Features | Rationale |
 |---|---|---|
@@ -69,7 +80,8 @@ The model uses 14 features across six signal categories:
 | Macro | oil price (dcoilwtico) | Proxy for purchasing power — lower spending → more unsold stock |
 | Footfall | transaction count | Fewer customers = more waste |
 | Store | type, city, cluster | Different formats and locations have distinct waste profiles |
-| Product | item family, on-promotion flag | Promotions boost sell-through; category determines spoilage rate |
+| Product | item family, on-promotion flag, avg_sales_7d | Promotions boost sell-through; category determines spoilage rate |
+| Lag / Volatility | waste_lag_1, waste_lag_7, sales_lag_1, avg_sales_14d, sales_volatility | Item-specific recent history captures momentum and variability |
 
 ### AI Matching Score (0–100)
 
@@ -92,12 +104,13 @@ Distance is calculated using the Haversine formula for accurate real-world kilom
 
 ## Dataset
 
-**Corporación Favorita Grocery Sales** (UCI-style supermarket data) with 7 source files: training, items, stores, testing, transactions, oil prices, and holidays/events.
+**Corporación Favorita Grocery Sales** (UCI-style supermarket data) with 6 source files: training, items, stores, transactions, oil prices, and holidays/events.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
+pip install xgboost   # required for surplus_forecast.py
 ```
 
 Place the CSV data files in the working directory, then:
@@ -113,22 +126,35 @@ python beneficiary_dashboard.py
 Or open the notebooks for interactive exploration with EDA charts:
 
 ```bash
-jupyter notebook notebooks/analytics.ipynb
+jupyter notebook analytics2.ipynb
 ```
 
 ## Outputs
 
-| File | Consumer |
+### Donor pipeline (`surplus_forecast.py`)
+
+| File | Description |
 |---|---|
-| `donor_surplus_forecast.csv` | Donor-facing dashboard — per-store surplus predictions |
-| `dashboard_payload.json` | Beneficiary-facing frontend — metrics, AI matches, nearby stores |
-| `eda_charts.png` | Exploratory analysis (wastage by family, day, holiday, store type) |
-| `feature_importance.png` | Model interpretability — ranked feature importance |
-| `donor_dashboard.png` | Donor dashboard visualisation |
+| `donor_surplus_forecast.csv` | Per-store surplus predictions with urgency labels |
+| `eda_charts.png` | 4-panel EDA visualisation (wastage by family, day, holiday, store type) |
+| `feature_importance.png` | Ranked XGBoost feature importance |
+| `donor_dashboard.png` | Donor-facing forecast dashboard |
+
+### Beneficiary pipeline (`beneficiary_dashboard.py`)
+
+| File | Description |
+|---|---|
+| `dashboard_payload.json` | Combined payload for frontend consumption |
+| `dashboard_metrics.json` | Summary metric cards (food received, money saved, MoM change) |
+| `ai_matches.json` | Top AI-recommended stores for the beneficiary |
+| `nearby_stores.json` | All stores within the configured radius |
+| `top_categories.json` | Food category breakdown from past pickups |
+| `recently_received.json` | Recent pickup history |
 
 ## Tech Stack
 
 - **pandas / NumPy** — data wrangling and feature engineering
-- **scikit-learn** — Random Forest Regressor, label encoding, train/test split
+- **scikit-learn** — Random Forest Classifier, label encoding, train/test split, metrics
+- **XGBoost** — gradient-boosted regressor for surplus quantity estimation
 - **matplotlib / seaborn** — EDA and dashboard visualisations
 - **Haversine** — real-world distance calculations for store matching
